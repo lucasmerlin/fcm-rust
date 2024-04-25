@@ -70,5 +70,5 @@ pub use crate::web::webpush_config::*;
 pub use crate::web::webpush_fcm_options::*;
 
 mod client;
-pub use crate::client::response::FcmError as Error;
+pub use crate::client::response::{FcmError as Error, *};
 pub use crate::client::*;
