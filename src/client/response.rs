@@ -109,6 +109,93 @@ pub struct MessageResult {
     pub error: Option<ErrorReason>,
 }
 
+/// The `errorCode` of an FCM v1 error, from the
+/// `google.firebase.fcm.v1.FcmError` entry in the error's `details`.
+/// See [ErrorCode](https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode).
+#[derive(Deserialize, Debug, PartialEq, Eq, Copy, Clone)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FcmErrorCode {
+    /// No more information is available about this error.
+    UnspecifiedError,
+    /// Request parameters were invalid: a malformed registration token, an
+    /// invalid field or a payload over the size limit. The message says which.
+    InvalidArgument,
+    /// The registration token is no longer valid (app uninstalled, token
+    /// expired, ...). Stop sending to it. Usually HTTP 404.
+    Unregistered,
+    /// The token belongs to a different sender. Usually HTTP 403.
+    SenderIdMismatch,
+    /// Rate limit for the device, topic or project exceeded. Back off and
+    /// honor `Retry-After`. Usually HTTP 429.
+    QuotaExceeded,
+    /// The server is overloaded. Usually HTTP 503.
+    Unavailable,
+    /// Unknown internal error. Usually HTTP 500.
+    Internal,
+    /// The APNs certificate / auth key or web push auth was invalid or missing.
+    ThirdPartyAuthError,
+    /// A code this crate doesn't know yet.
+    #[serde(other)]
+    Unknown,
+}
+
+/// A non-success response from the FCM v1 API, with what it said about why.
+#[derive(PartialEq, Debug)]
+pub struct ApiError {
+    /// The HTTP status code.
+    pub status: u16,
+    /// FCM's own error code, if the body carried one.
+    pub error_code: Option<FcmErrorCode>,
+    /// The human readable message, or the raw body if it wasn't the usual
+    /// JSON error shape.
+    pub message: String,
+    pub retry_after: Option<RetryAfter>,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: ErrorBodyInner,
+}
+
+#[derive(Deserialize)]
+struct ErrorBodyInner {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    details: Vec<ErrorDetail>,
+}
+
+#[derive(Deserialize)]
+struct ErrorDetail {
+    #[serde(rename = "errorCode")]
+    error_code: Option<FcmErrorCode>,
+}
+
+impl ApiError {
+    pub(crate) fn from_response(status: u16, body: &str, retry_after: Option<RetryAfter>) -> Self {
+        let (error_code, message) = match serde_json::from_str::<ErrorBody>(body) {
+            Ok(ErrorBody { error }) => (error.details.iter().find_map(|detail| detail.error_code), error.message),
+            Err(_) => (None, body.to_string()),
+        };
+        ApiError {
+            status,
+            error_code,
+            message,
+            retry_after,
+        }
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HTTP {}", self.status)?;
+        if let Some(code) = self.error_code {
+            write!(f, " {:?}", code)?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
 /// Fatal errors. Referred from [Firebase
 /// documentation](https://firebase.google.com/docs/cloud-messaging/http-server-ref#table9)
 #[derive(PartialEq, Debug)]
@@ -148,6 +235,10 @@ pub enum FcmError {
     ProjectIdError(String),
 
     AuthToken(String),
+
+    /// Any other non-success response (400, 403, 404, 429, ...). Check
+    /// [ApiError::error_code]: `Unregistered` means the token is dead.
+    Api(ApiError),
 }
 
 impl Error for FcmError {}
@@ -160,6 +251,7 @@ impl fmt::Display for FcmError {
             FcmError::ServerError(_) => write!(f, "the server couldn't process the request"),
             FcmError::ProjectIdError(error) => write!(f, "error getting project_id: {error}"),
             FcmError::AuthToken(error) => write!(f, "error getting auth token: {error}"),
+            FcmError::Api(error) => write!(f, "{error}"),
         }
     }
 }
@@ -231,6 +323,47 @@ mod tests {
 
             assert_eq!(Some(error_enum), fcm_response.error,)
         }
+    }
+
+    #[test]
+    fn test_api_error_from_v1_body() {
+        let body = json!({
+            "error": {
+                "code": 404,
+                "message": "Requested entity was not found.",
+                "status": "NOT_FOUND",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                        "errorCode": "UNREGISTERED"
+                    }
+                ]
+            }
+        });
+        let error = ApiError::from_response(404, &body.to_string(), None);
+        assert_eq!(error.status, 404);
+        assert_eq!(error.error_code, Some(FcmErrorCode::Unregistered));
+        assert_eq!(error.message, "Requested entity was not found.");
+
+        let body = json!({
+            "error": {
+                "code": 400,
+                "message": "The registration token is not a valid FCM registration token",
+                "status": "INVALID_ARGUMENT",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.BadRequest", "fieldViolations": []},
+                    {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": "SOMETHING_NEW"}
+                ]
+            }
+        });
+        let error = ApiError::from_response(400, &body.to_string(), None);
+        assert_eq!(error.error_code, Some(FcmErrorCode::Unknown));
+
+        let retry_after = Some(RetryAfter::Delay(Duration::seconds(3)));
+        let error = ApiError::from_response(429, "Too Many Requests", retry_after);
+        assert_eq!(error.error_code, None);
+        assert_eq!(error.message, "Too Many Requests");
+        assert_eq!(error.retry_after, Some(RetryAfter::Delay(Duration::seconds(3))));
     }
 
     #[test]

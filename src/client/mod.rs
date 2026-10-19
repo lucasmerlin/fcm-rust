@@ -1,6 +1,6 @@
 pub(crate) mod response;
 
-use crate::client::response::{ErrorReason, FcmError, FcmResponse, RetryAfter};
+use crate::client::response::{ApiError, ErrorReason, FcmError, FcmResponse, RetryAfter};
 use crate::{Message, MessageInternal};
 use gauth::serv_account::ServiceAccount;
 use reqwest::header::RETRY_AFTER;
@@ -161,12 +161,15 @@ impl Client {
                 }
             }
             StatusCode::UNAUTHORIZED => Err(FcmError::Unauthorized),
-            StatusCode::BAD_REQUEST => {
-                let body = response.text().await.unwrap();
-                Err(FcmError::InvalidMessage(format!("Bad Request ({body}")))
-            }
             status if status.is_server_error() => Err(FcmError::ServerError(retry_after)),
-            _ => Err(FcmError::InvalidMessage("Unknown Error".to_string())),
+            status => {
+                let body = response.text().await.unwrap_or_default();
+                Err(FcmError::Api(ApiError::from_response(
+                    status.as_u16(),
+                    &body,
+                    retry_after,
+                )))
+            }
         }
     }
 }
